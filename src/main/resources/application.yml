@@ -1,0 +1,28 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: ai-code-reviewer
+  ai:
+    dashscope:
+      # 阿里云百炼 API Key,从 https://bailian.console.aliyun.com/ 申请
+      api-key: ${DASHSCOPE_API_KEY:sk-在这里填你的key}
+      chat:
+        options:
+          model: qwen-plus
+          temperature: 0.3
+
+# Gitee 配置
+gitee:
+  # Gitee 个人访问令牌,从 https://gitee.com/profile/personal_access_tokens 创建
+  access-token: ${GITEE_ACCESS_TOKEN:在这里填你的token}
+  # Webhook 密码,与 Gitee 仓库 Webhook 配置里的密码保持一致
+  webhook-password: ${GITEE_WEBHOOK_PASSWORD:my-secret-pwd-12345}
+  # Gitee OpenAPI 基础 URL
+  api-base-url: https://gitee.com/api/v5
+
+logging:
+  level:
+    com.zhanghaidong.reviewer: DEBUG
+    org.springframework.ai: INFO
