@@ -5,6 +5,7 @@ import com.zhanghaidong.reviewer.dto.PullRequestEvent;
 import com.zhanghaidong.reviewer.dto.ReviewComment;
 import com.zhanghaidong.reviewer.dto.ReviewResult;
 import com.zhanghaidong.reviewer.service.GiteeService;
+import com.zhanghaidong.reviewer.service.PatchPositionResolver;
 import com.zhanghaidong.reviewer.service.ReviewService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -12,6 +13,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -27,33 +29,38 @@ import java.util.concurrent.ConcurrentMap;
 @RequestMapping("/webhook")
 public class WebhookController {
 
+    /** PR 微小改动跳过阈值 */
+    private static final int MIN_CHANGED_LINES = 3;
+
+    /** 单次评审最多发多少条行级评论(避免刷屏) */
+    private static final int MAX_LINE_COMMENTS = 15;
+
+    /** 去重窗口 5 分钟 */
+    private static final long DEDUP_WINDOW_MS = 5 * 60 * 1000L;
+
     private final GiteeService giteeService;
     private final ReviewService reviewService;
+    private final PatchPositionResolver positionResolver;
     private final String webhookPassword;
 
+    /** 已处理 PR 的去重缓存,key = owner/repo#number@head_sha */
     private final ConcurrentMap<String, Long> processedPrs = new ConcurrentHashMap<>();
 
-    private static final long DEDUP_WINDOW_MS = 5 * 60 * 1000L; // 5 分钟
     public WebhookController(GiteeService giteeService,
                              ReviewService reviewService,
+                             PatchPositionResolver positionResolver,
                              @Value("${gitee.webhook-password}") String webhookPassword) {
         this.giteeService = giteeService;
         this.reviewService = reviewService;
+        this.positionResolver = positionResolver;
         this.webhookPassword = webhookPassword;
     }
 
-    /**
-     * 健康检查
-     */
     @GetMapping("/ping")
     public Map<String, String> ping() {
         return Map.of("status", "ok", "service", "ai-code-reviewer");
     }
 
-    /**
-     * Gitee Webhook 接收入口
-     * Gitee 在请求头里会带 X-Gitee-Event,值为 "Merge Request Hook" 表示 PR 事件
-     */
     @PostMapping("/gitee")
     public ResponseEntity<Map<String, String>> handle(
             @RequestHeader(value = "X-Gitee-Event", required = false) String event,
@@ -62,19 +69,13 @@ public class WebhookController {
 
         log.info("收到 Gitee Webhook: event={}, action={}", event, payload.getAction());
 
-        // 1. 鉴权:Gitee 密码校验有两种方式
-        //    - 明文密码(放在 body.password 字段)
-        //    - 签名(放在 X-Gitee-Token header)
-        //    这里用明文密码方式,简单
         if (!webhookPassword.equals(payload.getPassword())
                 && !webhookPassword.equals(tokenHeader)) {
             log.warn("Webhook 鉴权失败");
             return ResponseEntity.status(401).body(Map.of("error", "unauthorized"));
         }
 
-        // 2. 只处理 PR 事件,且只在 open / update 时触发
         if (!"Merge Request Hook".equals(event)) {
-            log.info("非 PR 事件,跳过: {}", event);
             return ResponseEntity.ok(Map.of("status", "ignored"));
         }
         if (payload.getAction() == null
@@ -83,33 +84,24 @@ public class WebhookController {
             return ResponseEntity.ok(Map.of("status", "ignored"));
         }
 
-        // 3. 异步处理,Webhook 立即返回 200
         processAsync(payload);
-
         return ResponseEntity.ok(Map.of("status", "accepted"));
     }
 
-    /**
-     * 异步处理评审流程
-     */
     @Async
     public void processAsync(PullRequestEvent payload) {
         try {
             String owner = payload.getOwner();
             String repo = payload.getRepoName();
             Integer number = payload.getPullRequest().getNumber();
-
             String headSha = payload.getPullRequest().getHead() != null
                     ? payload.getPullRequest().getHead().getSha()
                     : "unknown";
 
-            // === 去重逻辑开始 ===
+            // ===== 去重 =====
             String dedupKey = String.format("%s/%s#%d@%s", owner, repo, number, headSha);
             long now = System.currentTimeMillis();
-
-            // 清理过期 key(避免内存膨胀)
             processedPrs.entrySet().removeIf(e -> now - e.getValue() > DEDUP_WINDOW_MS);
-
             Long lastTime = processedPrs.putIfAbsent(dedupKey, now);
             if (lastTime != null && now - lastTime < DEDUP_WINDOW_MS) {
                 log.info("⏭️ 跳过重复评审: {} (上次评审于 {} 秒前)",
@@ -117,35 +109,35 @@ public class WebhookController {
                 return;
             }
 
-            log.info("===== 开始评审: {}/{} PR #{} =====", owner, repo, number);
+            log.info("===== 开始评审: {}/{} PR #{} (sha={}) =====",
+                    owner, repo, number,
+                    headSha.length() >= 7 ? headSha.substring(0, 7) : headSha);
 
-            // 拿 diff
+            // ===== 拉文件 =====
             List<FileDiff> files = giteeService.getPullRequestFiles(owner, repo, number);
             if (files == null || files.isEmpty()) {
                 log.warn("PR 没有文件变更");
                 return;
             }
 
-            // 只评审 Java 文件
+            // ===== 过滤:只评审 Java 文件 + 跳过微小改动 =====
             List<FileDiff> javaFiles = files.stream()
                     .filter(f -> f.getFilename() != null && f.getFilename().endsWith(".java"))
+                    .filter(f -> !isTrivialChange(f))
                     .toList();
-            log.info("Java 文件数: {} / 总变更文件数: {}", javaFiles.size(), files.size());
+            log.info("有效 Java 文件数: {} / 总变更文件数: {}", javaFiles.size(), files.size());
 
             if (javaFiles.isEmpty()) {
-                log.info("没有 Java 文件变更,跳过");
+                log.info("没有需要评审的 Java 文件,跳过");
                 return;
             }
 
-            // 调 LLM 评审
+            // ===== LLM 评审 =====
             ReviewResult result = reviewService.review(javaFiles);
-
-            // 控制台打印(Day 1 核心交付物)
             printResult(owner, repo, number, result);
 
-            // Day 2 会把这里改成回写到 Gitee,Day 1 先发一条整体评论验证 API 通畅
-            String summary = buildSummary(result);
-            giteeService.createPullRequestComment(owner, repo, number, summary);
+            // ===== 回写到 Gitee =====
+            postToGitee(owner, repo, number, javaFiles, result);
 
             log.info("===== 评审完成: {}/{} PR #{} =====", owner, repo, number);
 
@@ -154,9 +146,157 @@ public class WebhookController {
         }
     }
 
-    private void printResult(String owner, String repo, Integer number, ReviewResult result) {
+    /**
+     * 判断微小改动:additions + deletions < 阈值
+     */
+    private boolean isTrivialChange(FileDiff f) {
+        int adds = parseIntSafe(f.getAdditions());
+        int dels = parseIntSafe(f.getDeletions());
+        boolean trivial = adds + dels < MIN_CHANGED_LINES;
+        if (trivial) {
+            log.debug("跳过微小改动: file={}, +{}, -{}", f.getFilename(), adds, dels);
+        }
+        return trivial;
+    }
+
+    private int parseIntSafe(String s) {
+        try {
+            return s == null ? 0 : Integer.parseInt(s);
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
+    /**
+     * 把评审结果回写到 Gitee
+     * 策略:
+     *  1. 始终发一条整体总结评论(放总分和摘要)
+     *  2. 每条 LLM 给的具体问题尝试发行级评论
+     *  3. 行级评论失败的(行号算不出来),收集起来追加到整体评论里
+     */
+    private void postToGitee(String owner, String repo, Integer number,
+                             List<FileDiff> javaFiles, ReviewResult result) {
+        // 1. 把每个文件的 patch -> 行号映射表 准备好(只算一次)
+        Map<String, Map<Integer, Integer>> fileLineMaps = new HashMap<>();
+        for (FileDiff f : javaFiles) {
+            fileLineMaps.put(f.getFilename(),
+                    positionResolver.buildLineToPositionMap(f.getPatchText()));
+        }
+
+        List<ReviewComment> comments = result.getComments() == null ? List.of() : result.getComments();
+        List<ReviewComment> failedComments = new java.util.ArrayList<>();
+        int posted = 0;
+
+        // 2. 逐条发行级评论
+        for (ReviewComment c : comments) {
+            if (posted >= MAX_LINE_COMMENTS) {
+                failedComments.add(c);
+                continue;
+            }
+
+            FileDiff file = javaFiles.stream()
+                    .filter(f -> f.getFilename().equals(c.getFilePath()))
+                    .findFirst()
+                    .orElse(null);
+            if (file == null) {
+                failedComments.add(c);
+                continue;
+            }
+
+            // 优先用 snippet 反查精确位置
+            Integer position = null;
+            Integer realLine = null;
+            PatchPositionResolver.LineAndPosition hit =
+                    positionResolver.resolveBySnippet(file.getPatchText(), c.getCodeSnippet());
+            if (hit != null) {
+                position = hit.position();
+                realLine = hit.line();
+            } else {
+                // 降级:用 LLM 给的 lineNumber 直接查映射表
+                Map<Integer, Integer> lineMap = fileLineMaps.get(c.getFilePath());
+                if (lineMap != null && c.getLineNumber() != null) {
+                    position = lineMap.get(c.getLineNumber());
+                    realLine = c.getLineNumber();
+                }
+            }
+
+            if (position == null) {
+                log.warn("无法定位: file={}, llmLine={}, snippet=[{}]",
+                        c.getFilePath(), c.getLineNumber(), c.getCodeSnippet());
+                failedComments.add(c);
+                continue;
+            }
+
+            log.info("📍 定位成功: {} 第{}行 (position={}) - 来源:{}",
+                    c.getFilePath(), realLine, position,
+                    hit != null ? "snippet反查" : "LLM行号");
+
+            boolean ok = giteeService.createLineComment(
+                    owner, repo, number,
+                    c.getFilePath(), position,
+                    formatLineCommentBody(c)
+            );
+            if (ok) {
+                posted++;
+            } else {
+                failedComments.add(c);
+            }
+        }
+
+        // 3. 整体总结评论(包含未能行级化的问题)
+        String summary = buildSummary(result, failedComments, posted);
+        giteeService.createPullRequestComment(owner, repo, number, summary);
+
+        log.info("评论统计: 行级={}, 降级={}", posted, failedComments.size());
+    }
+
+    /**
+     * 单条行级评论的 markdown 格式
+     */
+    private String formatLineCommentBody(ReviewComment c) {
+        String emoji = switch (c.getSeverity() == null ? "" : c.getSeverity()) {
+            case "BLOCKER", "CRITICAL" -> "🚨";
+            case "MAJOR" -> "⚠️";
+            case "MINOR" -> "💡";
+            default -> "ℹ️";
+        };
+        return String.format(
+                "%s **[%s] [%s]** %s\n\n**建议**: %s\n\n_由 ai-code-reviewer 自动生成_",
+                emoji,
+                c.getSeverity(), c.getCategory(),
+                c.getMessage(),
+                c.getSuggestion() == null ? "(无)" : c.getSuggestion()
+        );
+    }
+
+    /**
+     * 整体总结评论
+     */
+    private String buildSummary(ReviewResult result, List<ReviewComment> failed, int posted) {
         StringBuilder sb = new StringBuilder();
-        sb.append("\n");
+        sb.append("## 🤖 AI 代码评审报告\n\n");
+        sb.append("**总分**: ").append(result.getOverallScore()).append(" / 100  \n");
+        sb.append("**摘要**: ").append(result.getSummary()).append("  \n");
+        sb.append("**已发布行级评论**: ").append(posted).append(" 条\n\n");
+
+        if (!failed.isEmpty()) {
+            sb.append("### ⚠️ 以下问题未能定位到具体行号,在此汇总:\n\n");
+            int i = 1;
+            for (ReviewComment c : failed) {
+                sb.append("**").append(i++).append(". [").append(c.getSeverity()).append("] [")
+                        .append(c.getCategory()).append("] ")
+                        .append(c.getFilePath()).append(":").append(c.getLineNumber()).append("**\n");
+                sb.append("- 问题: ").append(c.getMessage()).append("\n");
+                sb.append("- 建议: ").append(c.getSuggestion()).append("\n\n");
+            }
+        }
+
+        sb.append("\n_由 ai-code-reviewer 自动生成 · Day 2_");
+        return sb.toString();
+    }
+
+    private void printResult(String owner, String repo, Integer number, ReviewResult result) {
+        StringBuilder sb = new StringBuilder("\n");
         sb.append("===========================================================\n");
         sb.append(" 评审结果: ").append(owner).append("/").append(repo).append(" PR #").append(number).append("\n");
         sb.append("===========================================================\n");
@@ -176,25 +316,5 @@ public class WebhookController {
         }
         sb.append("===========================================================\n");
         log.info(sb.toString());
-    }
-
-    private String buildSummary(ReviewResult result) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("## 🤖 AI 代码评审报告\n\n");
-        sb.append("**总分**: ").append(result.getOverallScore()).append(" / 100\n\n");
-        sb.append("**总结**: ").append(result.getSummary()).append("\n\n");
-        if (result.getComments() != null && !result.getComments().isEmpty()) {
-            sb.append("### 详细问题\n\n");
-            int i = 1;
-            for (ReviewComment c : result.getComments()) {
-                sb.append("**").append(i++).append(". [").append(c.getSeverity()).append("] [")
-                        .append(c.getCategory()).append("] ")
-                        .append(c.getFilePath()).append(":").append(c.getLineNumber()).append("**\n");
-                sb.append("- 问题: ").append(c.getMessage()).append("\n");
-                sb.append("- 建议: ").append(c.getSuggestion()).append("\n\n");
-            }
-        }
-        sb.append("\n_由 ai-code-reviewer 自动生成_");
-        return sb.toString();
     }
 }

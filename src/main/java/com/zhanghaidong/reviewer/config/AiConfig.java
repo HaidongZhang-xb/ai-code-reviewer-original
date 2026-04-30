@@ -2,9 +2,12 @@ package com.zhanghaidong.reviewer.config;
 
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.model.ChatModel;
+import org.springframework.boot.web.client.RestTemplateBuilder;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.web.client.RestTemplate;
+
+import java.time.Duration;
 
 /**
  * AI 与 HTTP 客户端配置
@@ -26,9 +29,13 @@ public class AiConfig {
 
     /**
      * RestTemplate,用于调用 Gitee OpenAPI
+     * 加上超时,避免 Gitee 抖动时拖死线程池
      */
     @Bean
-    public RestTemplate restTemplate() {
-        return new RestTemplate();
+    public RestTemplate restTemplate(RestTemplateBuilder builder) {
+        return builder
+                .connectTimeout(Duration.ofSeconds(5))
+                .readTimeout(Duration.ofSeconds(30))
+                .build();
     }
 }
