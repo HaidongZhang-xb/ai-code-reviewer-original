@@ -126,4 +126,46 @@ public class GiteeService {
         headers.setAccept(List.of(MediaType.APPLICATION_JSON));
         return headers;
     }
+    /**
+     * 获取指定 ref(分支/sha)上某个文件的原文内容
+     * Gitee API: GET /repos/{owner}/{repo}/contents/{path}
+     *
+     * @param ref 分支名或 commit sha
+     * @return 文件原文,失败返回 null
+     */
+    public String getFileContent(String owner, String repo, String filePath, String ref) {
+        String url = UriComponentsBuilder.fromHttpUrl(apiBaseUrl)
+                .path("/repos/{owner}/{repo}/contents/{path}")
+                .queryParam("access_token", accessToken)
+                .queryParam("ref", ref)
+                .buildAndExpand(owner, repo, filePath)
+                .toUriString();
+
+        try {
+            ResponseEntity<Map> response = restTemplate.exchange(
+                    url, HttpMethod.GET, new HttpEntity<>(jsonHeaders()), Map.class);
+
+            Map<?, ?> body = response.getBody();
+            if (body == null) return null;
+
+            String encoding = (String) body.get("encoding");
+            String content = (String) body.get("content");
+            if (content == null) return null;
+
+            if ("base64".equalsIgnoreCase(encoding)) {
+                // Gitee 返回的 base64 经常带换行,要先去掉
+                content = content.replaceAll("\\s+", "");
+                return new String(java.util.Base64.getDecoder().decode(content),
+                        java.nio.charset.StandardCharsets.UTF_8);
+            }
+            return content;
+        } catch (HttpClientErrorException e) {
+            log.warn("拉取文件内容失败: file={}, ref={}, status={}, body={}",
+                    filePath, ref, e.getStatusCode(), e.getResponseBodyAsString());
+            return null;
+        } catch (Exception e) {
+            log.warn("拉取文件内容异常: file={}, ref={}", filePath, ref, e);
+            return null;
+        }
+    }
 }

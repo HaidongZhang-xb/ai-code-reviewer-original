@@ -5,7 +5,8 @@ import org.springframework.stereotype.Component;
 
 import java.util.HashMap;
 import java.util.Map;
-
+import java.util.HashSet;
+import java.util.Set;
 /**
  * Patch 位置解析器
  *
@@ -176,4 +177,41 @@ public class PatchPositionResolver {
      * 简单值对象
      */
     public record LineAndPosition(int line, int position) {}
+    /**
+     * 提取 patch 中被改动的所有新文件行号
+     * 包括: 新增行(+) 和 删除行所在的位置(用最近的上下文行号近似表达)
+     *
+     * @return 改动行号集合
+     */
+    public Set<Integer> extractChangedLines(String patchText) {
+        Set<Integer> changed = new HashSet<>();
+        if (patchText == null || patchText.isBlank()) return changed;
+
+        String[] lines = patchText.split("\n");
+        int newFileLine = 0;
+
+        for (String line : lines) {
+            if (line.startsWith("@@")) {
+                Integer newStart = parseNewStart(line);
+                if (newStart != null) newFileLine = newStart - 1;
+                continue;
+            }
+
+            boolean isAdded = line.startsWith("+") && !line.startsWith("+++");
+            boolean isContext = line.startsWith(" ");
+            boolean isRemoved = line.startsWith("-") && !line.startsWith("---");
+
+            if (isAdded) {
+                newFileLine++;
+                changed.add(newFileLine);   // 新增行算改动
+            } else if (isContext) {
+                newFileLine++;              // 上下文行,不算改动但要计数
+            } else if (isRemoved) {
+                // 删除行不增加行号,但把"前一行"标记为受影响
+                // 这样 JavaContextExtractor 能定位到删除发生的位置
+                if (newFileLine > 0) changed.add(newFileLine);
+            }
+        }
+        return changed;
+    }
 }

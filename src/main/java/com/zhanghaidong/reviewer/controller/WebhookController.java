@@ -12,7 +12,9 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.web.bind.annotation.*;
-
+import com.zhanghaidong.reviewer.dto.FileContext;
+import com.zhanghaidong.reviewer.service.JavaContextExtractor;
+import java.util.Set;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -42,6 +44,7 @@ public class WebhookController {
     private final ReviewService reviewService;
     private final PatchPositionResolver positionResolver;
     private final String webhookPassword;
+    private final JavaContextExtractor contextExtractor;
 
     /** 已处理 PR 的去重缓存,key = owner/repo#number@head_sha */
     private final ConcurrentMap<String, Long> processedPrs = new ConcurrentHashMap<>();
@@ -49,10 +52,12 @@ public class WebhookController {
     public WebhookController(GiteeService giteeService,
                              ReviewService reviewService,
                              PatchPositionResolver positionResolver,
+                             JavaContextExtractor contextExtractor,
                              @Value("${gitee.webhook-password}") String webhookPassword) {
         this.giteeService = giteeService;
         this.reviewService = reviewService;
         this.positionResolver = positionResolver;
+        this.contextExtractor = contextExtractor;
         this.webhookPassword = webhookPassword;
     }
 
@@ -120,7 +125,7 @@ public class WebhookController {
                 return;
             }
 
-            // ===== 过滤:只评审 Java 文件 + 跳过微小改动 =====
+            // ===== 过滤 =====
             List<FileDiff> javaFiles = files.stream()
                     .filter(f -> f.getFilename() != null && f.getFilename().endsWith(".java"))
                     .filter(f -> !isTrivialChange(f))
@@ -132,11 +137,14 @@ public class WebhookController {
                 return;
             }
 
+            // ===== Day 3 新增:拉文件原文 + JavaParser 提取上下文 =====
+            Map<String, FileContext> contextMap = buildContextMap(owner, repo, headSha, javaFiles);
+
             // ===== LLM 评审 =====
-            ReviewResult result = reviewService.review(javaFiles);
+            ReviewResult result = reviewService.review(javaFiles, contextMap);
             printResult(owner, repo, number, result);
 
-            // ===== 回写到 Gitee =====
+            // ===== 回写 =====
             postToGitee(owner, repo, number, javaFiles, result);
 
             log.info("===== 评审完成: {}/{} PR #{} =====", owner, repo, number);
@@ -144,6 +152,30 @@ public class WebhookController {
         } catch (Exception e) {
             log.error("评审流程失败", e);
         }
+    }
+
+    /**
+     * Day 3:拉每个 Java 文件的完整源码,用 JavaParser 提取上下文
+     * 失败的文件返回空 FileContext,不阻塞主流程
+     */
+    private Map<String, FileContext> buildContextMap(String owner, String repo,
+                                                     String headSha, List<FileDiff> javaFiles) {
+        Map<String, FileContext> contextMap = new HashMap<>();
+        for (FileDiff f : javaFiles) {
+            // 删除的文件没必要提上下文
+            if ("removed".equalsIgnoreCase(f.getStatus())) continue;
+
+            String fullSource = giteeService.getFileContent(owner, repo, f.getFilename(), headSha);
+            if (fullSource == null) {
+                log.warn("无法拉取文件原文: {}", f.getFilename());
+                continue;
+            }
+
+            Set<Integer> changedLines = positionResolver.extractChangedLines(f.getPatchText());
+            FileContext ctx = contextExtractor.extract(f.getFilename(), fullSource, changedLines);
+            contextMap.put(f.getFilename(), ctx);
+        }
+        return contextMap;
     }
 
     /**
