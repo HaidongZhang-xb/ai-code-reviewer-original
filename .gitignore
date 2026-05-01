@@ -1,2 +1,10 @@
-# Project exclude paths
-/target/
+target/
+.idea/
+.vscode/
+*.iml
+*.log
+.DS_Store
+
+# 本地配置(API Key 等敏感信息)
+application-local.yml
+.env
