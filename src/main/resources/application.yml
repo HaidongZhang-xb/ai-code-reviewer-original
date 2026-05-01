@@ -12,6 +12,13 @@ spring:
         options:
           model: qwen-plus
           temperature: 0.3
+  mcp:
+    server:
+      name: ai-code-reviewer-mcp
+      version: 1.0.0
+      type: SYNC
+      sse-message-endpoint: /mcp/message
+      # SSE 端点默认 /sse,客户端连这个
 
 # Gitee 配置
 gitee:

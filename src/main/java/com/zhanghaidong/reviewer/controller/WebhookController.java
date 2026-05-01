@@ -20,6 +20,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import com.zhanghaidong.reviewer.agent.AgentPipeline;
+import com.zhanghaidong.reviewer.dto.AgentState;
+import com.zhanghaidong.reviewer.dto.TestGenResult;
+import com.zhanghaidong.reviewer.dto.ValidationResult;
 
 /**
  * Gitee Webhook 接收入口
@@ -45,7 +49,7 @@ public class WebhookController {
     private final PatchPositionResolver positionResolver;
     private final String webhookPassword;
     private final JavaContextExtractor contextExtractor;
-
+    private final AgentPipeline agentPipeline;
     /** 已处理 PR 的去重缓存,key = owner/repo#number@head_sha */
     private final ConcurrentMap<String, Long> processedPrs = new ConcurrentHashMap<>();
 
@@ -53,11 +57,13 @@ public class WebhookController {
                              ReviewService reviewService,
                              PatchPositionResolver positionResolver,
                              JavaContextExtractor contextExtractor,
+                             AgentPipeline agentPipeline,
                              @Value("${gitee.webhook-password}") String webhookPassword) {
         this.giteeService = giteeService;
         this.reviewService = reviewService;
         this.positionResolver = positionResolver;
         this.contextExtractor = contextExtractor;
+        this.agentPipeline = agentPipeline;
         this.webhookPassword = webhookPassword;
     }
 
@@ -125,7 +131,6 @@ public class WebhookController {
                 return;
             }
 
-            // ===== 过滤 =====
             List<FileDiff> javaFiles = files.stream()
                     .filter(f -> f.getFilename() != null && f.getFilename().endsWith(".java"))
                     .filter(f -> !isTrivialChange(f))
@@ -137,15 +142,29 @@ public class WebhookController {
                 return;
             }
 
-            // ===== Day 3 新增:拉文件原文 + JavaParser 提取上下文 =====
+            // ===== 上下文提取 =====
             Map<String, FileContext> contextMap = buildContextMap(owner, repo, headSha, javaFiles);
 
-            // ===== LLM 评审 =====
-            ReviewResult result = reviewService.review(javaFiles, contextMap);
+            // ===== Day 5: 构建 AgentState 并启动 Pipeline =====
+            AgentState state = new AgentState();
+            state.setOwner(owner);
+            state.setRepo(repo);
+            state.setPrNumber(number);
+            state.setHeadSha(headSha);
+            state.setFiles(javaFiles);
+            state.setContextMap(contextMap);
+
+            agentPipeline.run(state);
+
+            // ===== 输出结果 =====
+            ReviewResult result = state.getReviewResult();
+            if (result == null) {
+                result = new ReviewResult(0, "无评审结果", List.of());
+            }
             printResult(owner, repo, number, result);
 
-            // ===== 回写 =====
-            postToGitee(owner, repo, number, javaFiles, result);
+            // ===== 回写 Gitee =====
+            postToGitee(owner, repo, number, javaFiles, state);
 
             log.info("===== 评审完成: {}/{} PR #{} =====", owner, repo, number);
 
@@ -207,8 +226,10 @@ public class WebhookController {
      *  3. 行级评论失败的(行号算不出来),收集起来追加到整体评论里
      */
     private void postToGitee(String owner, String repo, Integer number,
-                             List<FileDiff> javaFiles, ReviewResult result) {
-        // 1. 把每个文件的 patch -> 行号映射表 准备好(只算一次)
+                             List<FileDiff> javaFiles, AgentState state) {
+        ReviewResult result = state.getReviewResult();
+        if (result == null) result = new ReviewResult(0, "无评审结果", List.of());
+
         Map<String, Map<Integer, Integer>> fileLineMaps = new HashMap<>();
         for (FileDiff f : javaFiles) {
             fileLineMaps.put(f.getFilename(),
@@ -219,7 +240,7 @@ public class WebhookController {
         List<ReviewComment> failedComments = new java.util.ArrayList<>();
         int posted = 0;
 
-        // 2. 逐条发行级评论
+        // 逐条发行级评论(逻辑保持 Day 4 不变)
         for (ReviewComment c : comments) {
             if (posted >= MAX_LINE_COMMENTS) {
                 failedComments.add(c);
@@ -235,7 +256,6 @@ public class WebhookController {
                 continue;
             }
 
-            // 优先用 snippet 反查精确位置
             Integer position = null;
             Integer realLine = null;
             PatchPositionResolver.LineAndPosition hit =
@@ -244,7 +264,6 @@ public class WebhookController {
                 position = hit.position();
                 realLine = hit.line();
             } else {
-                // 降级:用 LLM 给的 lineNumber 直接查映射表
                 Map<Integer, Integer> lineMap = fileLineMaps.get(c.getFilePath());
                 if (lineMap != null && c.getLineNumber() != null) {
                     position = lineMap.get(c.getLineNumber());
@@ -268,18 +287,16 @@ public class WebhookController {
                     c.getFilePath(), position,
                     formatLineCommentBody(c)
             );
-            if (ok) {
-                posted++;
-            } else {
-                failedComments.add(c);
-            }
+            if (ok) posted++;
+            else failedComments.add(c);
         }
 
-        // 3. 整体总结评论(包含未能行级化的问题)
-        String summary = buildSummary(result, failedComments, posted);
+        // 整体总结评论(包含生成的测试)
+        String summary = buildSummary(state, failedComments, posted);
         giteeService.createPullRequestComment(owner, repo, number, summary);
 
-        log.info("评论统计: 行级={}, 降级={}", posted, failedComments.size());
+        log.info("评论统计: 行级={}, 降级={}, 生成测试={}",
+                posted, failedComments.size(), state.getGeneratedTests().size());
     }
 
     /**
@@ -304,13 +321,16 @@ public class WebhookController {
     /**
      * 整体总结评论
      */
-    private String buildSummary(ReviewResult result, List<ReviewComment> failed, int posted) {
+    private String buildSummary(AgentState state, List<ReviewComment> failed, int posted) {
+        ReviewResult result = state.getReviewResult();
         StringBuilder sb = new StringBuilder();
-        sb.append("## 🤖 AI 代码评审报告\n\n");
+        sb.append("## 🤖 AI 代码评审报告 (Multi-Agent)\n\n");
         sb.append("**总分**: ").append(result.getOverallScore()).append(" / 100  \n");
         sb.append("**摘要**: ").append(result.getSummary()).append("  \n");
-        sb.append("**已发布行级评论**: ").append(posted).append(" 条\n\n");
+        sb.append("**已发布行级评论**: ").append(posted).append(" 条  \n");
+        sb.append("**执行 Agent**: ").append(String.join(" → ", state.getExecutedAgents())).append("\n\n");
 
+        // 降级评论
         if (!failed.isEmpty()) {
             sb.append("### ⚠️ 以下问题未能定位到具体行号,在此汇总:\n\n");
             int i = 1;
@@ -323,7 +343,39 @@ public class WebhookController {
             }
         }
 
-        sb.append("\n_由 ai-code-reviewer 自动生成 · Day 2_");
+        // === Day 5 新增:生成的测试代码 ===
+        if (!state.getGeneratedTests().isEmpty()) {
+            sb.append("### 🧪 自动生成的单元测试\n\n");
+            for (Map.Entry<String, TestGenResult> entry : state.getGeneratedTests().entrySet()) {
+                TestGenResult tg = entry.getValue();
+                ValidationResult vr = state.getValidations().stream()
+                        .filter(v -> tg.getTestClassName().equals(v.getTestClassName()))
+                        .findFirst().orElse(null);
+
+                sb.append("#### ").append(tg.getTestClassName());
+                if (vr != null) {
+                    sb.append(vr.isPassed() ? " ✅" : " ❌");
+                }
+                sb.append("\n\n");
+                sb.append("**被测方法**: `").append(tg.getTargetMethod()).append("`  \n");
+                sb.append("**说明**: ").append(tg.getDescription()).append("  \n");
+                if (vr != null) {
+                    sb.append("**验证级别**: ").append(vr.getLevel()).append("  \n");
+                    if (!vr.isPassed()) {
+                        sb.append("**❌ 验证失败**: ").append(vr.getErrorMessage()).append("  \n");
+                    }
+                    if (vr.getIssues() != null && !vr.getIssues().isEmpty()) {
+                        sb.append("**建议**:\n");
+                        for (String issue : vr.getIssues()) {
+                            sb.append("- ").append(issue).append("\n");
+                        }
+                    }
+                }
+                sb.append("\n```java\n").append(tg.getTestCode()).append("\n```\n\n");
+            }
+        }
+
+        sb.append("\n_由 ai-code-reviewer 自动生成 · Multi-Agent Pipeline_");
         return sb.toString();
     }
 
