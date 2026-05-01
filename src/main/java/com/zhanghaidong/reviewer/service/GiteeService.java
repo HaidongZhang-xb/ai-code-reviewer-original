@@ -6,8 +6,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.*;
 import org.springframework.stereotype.Service;
-import org.springframework.util.LinkedMultiValueMap;
-import org.springframework.util.MultiValueMap;
+import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.util.UriComponentsBuilder;
 
@@ -39,7 +38,6 @@ public class GiteeService {
 
     /**
      * 获取 PR 的文件 diff 列表
-     * GET /repos/{owner}/{repo}/pulls/{number}/files
      */
     public List<FileDiff> getPullRequestFiles(String owner, String repo, Integer number) {
         String url = UriComponentsBuilder.fromHttpUrl(apiBaseUrl)
@@ -63,11 +61,9 @@ public class GiteeService {
     }
 
     /**
-     * 在 PR 上发表整体评论(非行级)
-     * POST /repos/{owner}/{repo}/pulls/{number}/comments
-     * 整体评论可以直接用 issue 评论接口,也可用 PR 评论接口的 body 参数
+     * 在 PR 上发表整体评论(用作降级方案)
      */
-    public void createPullRequestComment(String owner, String repo, Integer number, String body) {
+    public boolean createPullRequestComment(String owner, String repo, Integer number, String body) {
         String url = UriComponentsBuilder.fromHttpUrl(apiBaseUrl)
                 .path("/repos/{owner}/{repo}/pulls/{number}/comments")
                 .buildAndExpand(owner, repo, number)
@@ -77,25 +73,28 @@ public class GiteeService {
         payload.put("access_token", accessToken);
         payload.put("body", body);
 
-        HttpEntity<Map<String, Object>> entity = new HttpEntity<>(payload, jsonHeaders());
-
         try {
-            restTemplate.postForEntity(url, entity, String.class);
+            restTemplate.postForEntity(url, new HttpEntity<>(payload, jsonHeaders()), String.class);
             log.info("整体评论已发表: PR #{}", number);
+            return true;
+        } catch (HttpClientErrorException e) {
+            log.error("发表整体评论失败: status={}, body={}", e.getStatusCode(), e.getResponseBodyAsString());
+            return false;
         } catch (Exception e) {
-            log.error("发表 PR 评论失败", e);
+            log.error("发表整体评论失败", e);
+            return false;
         }
     }
 
     /**
-     * 行级评论(Day 2 用,Day 1 先打日志即可)
-     * Gitee 行级评论 API 参数:
-     *   path: 文件路径
-     *   position: diff 中的位置(注意不是行号,是 patch 序号)
-     *   body: 评论内容
+     * 行级评论
+     * Gitee API: POST /repos/{owner}/{repo}/pulls/{number}/comments
+     * 行级评论必须带 path + position 两个参数
+     *
+     * @param position diff 中的行序号(由 PatchPositionResolver 计算得出)
      */
-    public void createLineComment(String owner, String repo, Integer number,
-                                  String filePath, Integer position, String body) {
+    public boolean createLineComment(String owner, String repo, Integer number,
+                                     String filePath, Integer position, String body) {
         String url = UriComponentsBuilder.fromHttpUrl(apiBaseUrl)
                 .path("/repos/{owner}/{repo}/pulls/{number}/comments")
                 .buildAndExpand(owner, repo, number)
@@ -107,13 +106,17 @@ public class GiteeService {
         payload.put("path", filePath);
         payload.put("position", position);
 
-        HttpEntity<Map<String, Object>> entity = new HttpEntity<>(payload, jsonHeaders());
-
         try {
-            restTemplate.postForEntity(url, entity, String.class);
-            log.info("行级评论已发表: {} 第 {} 行", filePath, position);
+            restTemplate.postForEntity(url, new HttpEntity<>(payload, jsonHeaders()), String.class);
+            log.info("✅ 行级评论已发表: {} position={}", filePath, position);
+            return true;
+        } catch (HttpClientErrorException e) {
+            log.warn("行级评论发表失败: status={}, file={}, position={}, body={}",
+                    e.getStatusCode(), filePath, position, e.getResponseBodyAsString());
+            return false;
         } catch (Exception e) {
-            log.error("发表行级评论失败", e);
+            log.warn("行级评论发表失败: file={}, position={}", filePath, position, e);
+            return false;
         }
     }
 
@@ -122,5 +125,47 @@ public class GiteeService {
         headers.setContentType(MediaType.APPLICATION_JSON);
         headers.setAccept(List.of(MediaType.APPLICATION_JSON));
         return headers;
+    }
+    /**
+     * 获取指定 ref(分支/sha)上某个文件的原文内容
+     * Gitee API: GET /repos/{owner}/{repo}/contents/{path}
+     *
+     * @param ref 分支名或 commit sha
+     * @return 文件原文,失败返回 null
+     */
+    public String getFileContent(String owner, String repo, String filePath, String ref) {
+        String url = UriComponentsBuilder.fromHttpUrl(apiBaseUrl)
+                .path("/repos/{owner}/{repo}/contents/{path}")
+                .queryParam("access_token", accessToken)
+                .queryParam("ref", ref)
+                .buildAndExpand(owner, repo, filePath)
+                .toUriString();
+
+        try {
+            ResponseEntity<Map> response = restTemplate.exchange(
+                    url, HttpMethod.GET, new HttpEntity<>(jsonHeaders()), Map.class);
+
+            Map<?, ?> body = response.getBody();
+            if (body == null) return null;
+
+            String encoding = (String) body.get("encoding");
+            String content = (String) body.get("content");
+            if (content == null) return null;
+
+            if ("base64".equalsIgnoreCase(encoding)) {
+                // Gitee 返回的 base64 经常带换行,要先去掉
+                content = content.replaceAll("\\s+", "");
+                return new String(java.util.Base64.getDecoder().decode(content),
+                        java.nio.charset.StandardCharsets.UTF_8);
+            }
+            return content;
+        } catch (HttpClientErrorException e) {
+            log.warn("拉取文件内容失败: file={}, ref={}, status={}, body={}",
+                    filePath, ref, e.getStatusCode(), e.getResponseBodyAsString());
+            return null;
+        } catch (Exception e) {
+            log.warn("拉取文件内容异常: file={}, ref={}", filePath, ref, e);
+            return null;
+        }
     }
 }

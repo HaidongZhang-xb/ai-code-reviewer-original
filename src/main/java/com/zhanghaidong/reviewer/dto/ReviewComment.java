@@ -4,29 +4,23 @@ import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
-/**
- * 行级评审意见
- *
- * @author 张海东
- */
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
 public class ReviewComment {
 
-    /**
-     * 文件路径
-     */
     private String filePath;
 
     /**
-     * 行号(对应 patch 中新文件的行号)
+     * LLM 给的预估行号(可能不准,仅作降级用)
      */
     private Integer lineNumber;
 
     /**
-     * 严重等级: BLOCKER / CRITICAL / MAJOR / MINOR / INFO
+     * 问题代码的精确片段(单行,从原始代码复制,我们用它来反查真实行号)
      */
+    private String codeSnippet;
+
     private String severity;
 
     /**
