@@ -25,7 +25,10 @@ import java.util.Set;
 public class JavaContextExtractor {
 
     private final JavaParser javaParser = new JavaParser();
-
+    private final SkillRouter skillRouter;
+    public JavaContextExtractor(SkillRouter skillRouter) {
+        this.skillRouter = skillRouter;
+    }
     /**
      * 从完整 Java 源码中提取上下文
      *
@@ -56,6 +59,7 @@ public class JavaContextExtractor {
 
         if (classOpt.isEmpty()) {
             log.debug("文件中没有找到类声明: {}", filePath);
+            ctx.setSkillName(skillRouter.route(ctx, filePath, fullSource));
             return ctx;
         }
 
@@ -89,10 +93,12 @@ public class JavaContextExtractor {
             }
         }
 
-        log.info("AST 提取完成: file={}, class={}, fields={}, allMethods={}, changedMethods={}",
-                filePath, ctx.getClassName(), ctx.getFields().size(),
-                ctx.getAllMethodSignatures().size(), ctx.getChangedMethods().size());
+        ctx.setSkillName(skillRouter.route(ctx, filePath, fullSource));
 
+        log.info("AST 提取完成: file={}, class={}, fields={}, allMethods={}, changedMethods={}, skill={}",
+                filePath, ctx.getClassName(), ctx.getFields().size(),
+                ctx.getAllMethodSignatures().size(), ctx.getChangedMethods().size(),
+                ctx.getSkillName());
         return ctx;
     }
 

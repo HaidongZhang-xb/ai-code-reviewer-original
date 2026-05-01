@@ -35,4 +35,6 @@ public class FileContext {
 
     /** 本次改动涉及的方法(完整源码) */
     private List<MethodContext> changedMethods = new ArrayList<>();
+    /** 该文件命中的 Skill 名称(spring-controller / mybatis-mapper / ...) */
+    private String skillName;
 }
