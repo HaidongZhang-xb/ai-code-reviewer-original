@@ -10,6 +10,8 @@ import com.github.javaparser.ast.expr.AnnotationExpr;
 import com.zhanghaidong.reviewer.dto.AgentState;
 import com.zhanghaidong.reviewer.dto.TestGenResult;
 import com.zhanghaidong.reviewer.dto.ValidationResult;
+import com.zhanghaidong.reviewer.service.DockerSandboxService;
+import com.zhanghaidong.reviewer.service.DockerSandboxService.SandboxResult;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
@@ -19,10 +21,15 @@ import java.util.Map;
 import java.util.Optional;
 
 /**
- * 验证 TestGenAgent 生成的测试代码
+ * 测试代码验证 Agent
  *
- * 当前实现: 语法级验证(JavaParser 解析 + 静态规则检查)
- * 后续可扩展: 完整 mvn 编译(需在 Docker 沙箱中拉取项目依赖)
+ * 完整复刻 Meta TestGen-LLM 论文的过滤管道(本项目实现 Level 1-3):
+ *  - Level 1 SYNTAX:  JavaParser 语法解析(快,本地执行)
+ *  - Level 2 COMPILE: Docker 容器内 mvn test-compile
+ *  - Level 3 EXECUTE: Docker 容器内 mvn test
+ *  - Level 4 COVERAGE: JaCoCo 覆盖率(规划中)
+ *
+ * 任一级失败即停止后续验证(fail fast)
  *
  * @author 张海东
  */
@@ -31,6 +38,11 @@ import java.util.Optional;
 public class ValidatorAgent implements Agent {
 
     private final JavaParser javaParser = new JavaParser();
+    private final DockerSandboxService sandboxService;
+
+    public ValidatorAgent(DockerSandboxService sandboxService) {
+        this.sandboxService = sandboxService;
+    }
 
     @Override
     public String name() {
@@ -59,9 +71,32 @@ public class ValidatorAgent implements Agent {
     }
 
     private ValidationResult validate(TestGenResult tg) {
+        // ============= Level 1: 语法验证 =============
+        ValidationResult syntax = validateSyntax(tg);
+        if (!syntax.isPassed()) {
+            log.warn("[{}] ❌ Level 1 语法失败: {}", name(), syntax.getErrorMessage());
+            return syntax;
+        }
+        log.info("[{}] ✅ Level 1 语法通过: {}", name(), tg.getTestClassName());
+
+        // ============= Level 2/3: Docker 沙箱 =============
+        if (!sandboxService.isEnabled()) {
+            log.info("[{}] 沙箱未启用,跳过 Level 2/3,以 Level 1 结果为准", name());
+            return syntax;
+        }
+
+        SandboxResult sandbox = sandboxService.compileAndTest(
+                tg.getTestClassName(), tg.getTestCode());
+
+        return mergeWithSandbox(syntax, sandbox);
+    }
+
+    /**
+     * Level 1: JavaParser 语法验证(原逻辑保留)
+     */
+    private ValidationResult validateSyntax(TestGenResult tg) {
         List<String> issues = new ArrayList<>();
 
-        // === 1. JavaParser 解析 ===
         ParseResult<CompilationUnit> parseResult = javaParser.parse(tg.getTestCode());
         if (!parseResult.isSuccessful() || parseResult.getResult().isEmpty()) {
             String errMsg = parseResult.getProblems().stream()
@@ -74,7 +109,6 @@ public class ValidatorAgent implements Agent {
         }
         CompilationUnit cu = parseResult.getResult().get();
 
-        // === 2. 类结构检查 ===
         Optional<ClassOrInterfaceDeclaration> classOpt =
                 cu.findFirst(ClassOrInterfaceDeclaration.class);
         if (classOpt.isEmpty()) {
@@ -83,7 +117,6 @@ public class ValidatorAgent implements Agent {
         }
         ClassOrInterfaceDeclaration testClass = classOpt.get();
 
-        // === 3. 必须有 @Test 注解的方法 ===
         long testMethodCount = testClass.getMethods().stream()
                 .filter(this::hasTestAnnotation)
                 .count();
@@ -93,36 +126,75 @@ public class ValidatorAgent implements Agent {
                     "未找到 @Test 方法", issues);
         }
         if (testMethodCount < 3) {
-            issues.add("⚠️ 测试方法数 " + testMethodCount + ",建议至少 3 个(正常/边界/异常)");
+            issues.add("⚠️ 测试方法数 " + testMethodCount + ",建议至少 3 个");
         }
 
-        // === 4. 必须包含断言 ===
         boolean hasAssertion = testClass.getMethods().stream()
                 .filter(this::hasTestAnnotation)
                 .anyMatch(this::hasAssertion);
-
         if (!hasAssertion) {
             return new ValidationResult(tg.getTestClassName(), "SYNTAX", false,
-                    "测试方法缺少断言(assertXxx),疑似假测试", issues);
+                    "测试方法缺少断言,疑似假测试", issues);
         }
 
-        // === 5. 应使用 Mockito ===
         boolean hasMockito = tg.getTestCode().contains("@Mock")
-                || tg.getTestCode().contains("@InjectMocks")
-                || tg.getTestCode().contains("Mockito.");
+                || tg.getTestCode().contains("@InjectMocks");
         if (!hasMockito) {
             issues.add("⚠️ 未使用 Mockito,可能未隔离外部依赖");
         }
 
-        // === 6. JUnit 5 规范 ===
         if (tg.getTestCode().contains("import org.junit.Test;")) {
-            issues.add("⚠️ 使用了 JUnit 4 的 @Test,应改用 JUnit 5 (org.junit.jupiter.api.Test)");
+            issues.add("⚠️ 使用了 JUnit 4 的 @Test,应改用 JUnit 5");
         }
 
-        log.info("[{}] ✓ {} 验证通过 ({} 个测试方法,{} 条建议)",
-                name(), tg.getTestClassName(), testMethodCount, issues.size());
-
         return new ValidationResult(tg.getTestClassName(), "SYNTAX", true, null, issues);
+    }
+
+    /**
+     * 把 Level 1 结果与沙箱结果合并
+     */
+    private ValidationResult mergeWithSandbox(ValidationResult syntax, SandboxResult sandbox) {
+        ValidationResult result = new ValidationResult();
+        result.setTestClassName(syntax.getTestClassName());
+        result.setIssues(syntax.getIssues() != null ? syntax.getIssues() : new ArrayList<>());
+
+        // Level 2: 编译
+        result.setCompileSuccess(sandbox.isCompilePassed());
+        result.setCompileOutput(truncate(sandbox.getCompileOutput()));
+
+        if (!sandbox.isCompilePassed()) {
+            result.setHighestPassedLevel("SYNTAX");
+            result.setPassed(false);
+            result.setErrorMessage("Level 2 编译失败: " + truncate(sandbox.getCompileOutput()));
+            log.warn("[{}] ❌ Level 2 编译失败: {}", name(), result.getTestClassName());
+            return result;
+        }
+        log.info("[{}] ✅ Level 2 编译通过: {}", name(), result.getTestClassName());
+
+        // Level 3: 执行
+        result.setExecuteSuccess(sandbox.isExecutePassed());
+        result.setExecuteOutput(truncate(sandbox.getExecuteOutput()));
+
+        if (sandbox.getStats() != null) {
+            result.setTestsRun(sandbox.getStats().testsRun);
+            result.setTestsPassed(sandbox.getStats().testsPassed);
+            result.setTestsFailed(sandbox.getStats().testsFailed);
+        }
+
+        if (!sandbox.isExecutePassed()) {
+            result.setHighestPassedLevel("COMPILE");
+            result.setPassed(false);
+            result.setErrorMessage("Level 3 执行失败: " + sandbox.getErrorMessage());
+            log.warn("[{}] ❌ Level 3 执行失败: {}", name(), result.getTestClassName());
+            return result;
+        }
+
+        result.setHighestPassedLevel("EXECUTE");
+        result.setPassed(true);
+        log.info("[{}] ✅ Level 3 执行通过: {} ({} run, {} passed, {} failed)",
+                name(), result.getTestClassName(),
+                result.getTestsRun(), result.getTestsPassed(), result.getTestsFailed());
+        return result;
     }
 
     private boolean hasTestAnnotation(MethodDeclaration method) {
@@ -137,5 +209,11 @@ public class ValidatorAgent implements Agent {
         return body.contains("assert")
                 || body.contains("Assertions.")
                 || body.contains("verify(");
+    }
+
+    private String truncate(String s) {
+        if (s == null) return null;
+        if (s.length() <= 1500) return s;
+        return s.substring(0, 1500) + "\n... [输出已截断] ...";
     }
 }

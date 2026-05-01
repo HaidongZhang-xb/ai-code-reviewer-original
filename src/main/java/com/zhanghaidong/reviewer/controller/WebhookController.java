@@ -4,16 +4,15 @@ import com.zhanghaidong.reviewer.dto.FileDiff;
 import com.zhanghaidong.reviewer.dto.PullRequestEvent;
 import com.zhanghaidong.reviewer.dto.ReviewComment;
 import com.zhanghaidong.reviewer.dto.ReviewResult;
-import com.zhanghaidong.reviewer.service.GiteeService;
-import com.zhanghaidong.reviewer.service.PatchPositionResolver;
-import com.zhanghaidong.reviewer.service.ReviewService;
+import com.zhanghaidong.reviewer.service.*;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Profile;
 import org.springframework.http.ResponseEntity;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.web.bind.annotation.*;
 import com.zhanghaidong.reviewer.dto.FileContext;
-import com.zhanghaidong.reviewer.service.JavaContextExtractor;
+
 import java.util.Set;
 import java.util.HashMap;
 import java.util.List;
@@ -52,12 +51,13 @@ public class WebhookController {
     private final AgentPipeline agentPipeline;
     /** 已处理 PR 的去重缓存,key = owner/repo#number@head_sha */
     private final ConcurrentMap<String, Long> processedPrs = new ConcurrentHashMap<>();
-
+    private final DockerSandboxService sandboxServiceForTesting;
     public WebhookController(GiteeService giteeService,
                              ReviewService reviewService,
                              PatchPositionResolver positionResolver,
                              JavaContextExtractor contextExtractor,
                              AgentPipeline agentPipeline,
+                             DockerSandboxService sandboxServiceForTesting,
                              @Value("${gitee.webhook-password}") String webhookPassword) {
         this.giteeService = giteeService;
         this.reviewService = reviewService;
@@ -65,6 +65,7 @@ public class WebhookController {
         this.contextExtractor = contextExtractor;
         this.agentPipeline = agentPipeline;
         this.webhookPassword = webhookPassword;
+        this.sandboxServiceForTesting = sandboxServiceForTesting;
     }
 
     @GetMapping("/ping")
@@ -360,9 +361,19 @@ public class WebhookController {
                 sb.append("**被测方法**: `").append(tg.getTargetMethod()).append("`  \n");
                 sb.append("**说明**: ").append(tg.getDescription()).append("  \n");
                 if (vr != null) {
-                    sb.append("**验证级别**: ").append(vr.getLevel()).append("  \n");
-                    if (!vr.isPassed()) {
-                        sb.append("**❌ 验证失败**: ").append(vr.getErrorMessage()).append("  \n");
+                    sb.append("**最高通过级别**: ").append(vr.getHighestPassedLevel()).append("  \n");
+                    if (vr.getCompileSuccess() != null) {
+                        sb.append("**Level 2 编译**: ").append(vr.getCompileSuccess() ? "✅" : "❌").append("  \n");
+                    }
+                    if (vr.getExecuteSuccess() != null) {
+                        sb.append("**Level 3 执行**: ").append(vr.getExecuteSuccess() ? "✅" : "❌");
+                        if (vr.getTestsRun() != null && vr.getTestsRun() > 0) {
+                            sb.append(" (").append(vr.getTestsPassed()).append("/").append(vr.getTestsRun()).append(" passed)");
+                        }
+                        sb.append("  \n");
+                    }
+                    if (!vr.isPassed() && vr.getErrorMessage() != null) {
+                        sb.append("**❌ 失败原因**: ").append(vr.getErrorMessage()).append("  \n");
                     }
                     if (vr.getIssues() != null && !vr.getIssues().isEmpty()) {
                         sb.append("**建议**:\n");
@@ -400,5 +411,30 @@ public class WebhookController {
         }
         sb.append("===========================================================\n");
         log.info(sb.toString());
+    }
+    @Profile("dev")
+    @GetMapping("/test/sandbox")
+    public Map<String, Object> testSandbox() {
+        String testCode = """
+            import org.junit.jupiter.api.Test;
+            import static org.junit.jupiter.api.Assertions.*;
+
+            class MyTest {
+                @Test
+                void test1() { assertEquals(2, 1 + 1); }
+                @Test
+                void test2() { assertNotNull("hello"); }
+                @Test
+                void test3() { assertTrue(true); }
+            }
+            """;
+        DockerSandboxService.SandboxResult result =
+                sandboxServiceForTesting.compileAndTest("MyTest", testCode);
+        return Map.of(
+                "compilePassed", result.isCompilePassed(),
+                "executePassed", result.isExecutePassed(),
+                "stats", result.getStats() == null ? "null" : result.getStats(),
+                "error", result.getErrorMessage() == null ? "ok" : result.getErrorMessage()
+        );
     }
 }
