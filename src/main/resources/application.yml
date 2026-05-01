@@ -33,3 +33,13 @@ logging:
   level:
     com.zhanghaidong.reviewer: DEBUG
     org.springframework.ai: INFO
+
+sandbox:
+  # 是否启用 Docker 沙箱(关闭时 ValidatorAgent 只跑 Level 1 语法检查)
+  enabled: true
+  # Maven Docker 镜像
+  docker-image: maven:3.9-eclipse-temurin-17
+  # 单次容器执行超时(秒)
+  timeout-seconds: 120
+  # 工作根目录(Java 临时目录下创建子目录)
+  work-dir-base: ${java.io.tmpdir}/ai-code-reviewer-sandbox
