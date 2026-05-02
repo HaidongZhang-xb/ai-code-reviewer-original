@@ -99,34 +99,94 @@ public class TestGenAgent implements Agent {
     }
 
     private TestGenResult generateTestForMethod(FileContext ctx, MethodContext method) {
-        String testClassName = ctx.getClassName() + "Test";
+        String testClassName = "GeneratedTest";
 
         String userPrompt = """
-                你是一名资深 Java 测试工程师,请为下面的方法生成 **JUnit 5 + Mockito** 单元测试。
+        你是一名资深 Java 测试工程师,请为下面的方法生成 **JUnit 5** 单元测试。
 
-                【被测类信息】
-                类名: %s
-                类注解: %s
-                依赖字段:
-                %s
+        【被测类信息】
+        类名: %s
+        类注解: %s
+        依赖字段:
+        %s
 
-                【被测方法】
-                签名: %s
-                方法源码:
-                %s
+        【被测方法】
+        签名: %s
+        方法源码:
+        %s
 
-                【生成要求】
-                1. 使用 JUnit 5 (@Test, @ExtendWith(MockitoExtension.class))
-                2. 用 @Mock 声明所有依赖,@InjectMocks 注入被测类
-                3. 至少覆盖 3 个场景: 正常分支 / 边界情况 / 异常分支
-                4. 每个测试用 @DisplayName 写中文说明
-                5. 必须包含 Assertions 断言(assertEquals/assertNotNull/assertThrows 等)
-                6. 不要写假断言(只调用方法不验证结果是反模式)
+        【⚠️ 沙箱执行约束 - 这部分至关重要,违反将导致编译失败】
 
-                【输出格式】
-                直接输出完整的 Java 测试类源码,**不要带 markdown 代码块标记**,不要任何额外说明文字。
-                第一行从 package 或 import 开始。
-                """.formatted(
+        测试代码将在隔离 Docker 沙箱中执行,**沙箱里只有 JUnit 5 和 Mockito,没有任何被测项目的类**。
+
+        因此你必须遵守以下规则:
+
+        1. **不要写 package 声明**(测试类放在默认包)
+
+        2. **不要 import 任何被测项目的类**(包括被测类本身、Entity、Mapper、Service 等)
+
+        3. **不要使用 @InjectMocks / @Mock 注入被测类**(因为沙箱里没有被测类)
+
+        4. **必须把被测方法的代码完整复制到测试类内部**作为静态方法,直接测试这个静态副本
+
+        5. 只能 import 以下类型:
+           - org.junit.jupiter.api.* (Test, DisplayName, BeforeEach 等)
+           - org.junit.jupiter.api.Assertions.*
+           - java 标准库 (java.util.*, java.lang.*, java.time.* 等)
+
+        6. 至少 3 个 @Test 方法,覆盖正常 / 边界 / 异常分支
+        7. 每个测试用 @DisplayName 写中文说明
+        8. 必须包含 Assertions 断言
+
+        9. **直接输出 Java 源码,不要带 markdown 代码块标记,不要任何额外说明文字**
+
+        【正确示例】
+        如果被测方法是 `public boolean isPalindrome(String s)`,正确的测试代码应该是:
+
+        import org.junit.jupiter.api.Test;
+        import org.junit.jupiter.api.DisplayName;
+        import static org.junit.jupiter.api.Assertions.*;
+
+        class GeneratedTest {
+            // 把被测方法完整复制到这里
+            static boolean isPalindrome(String s) {
+                if (s == null) return false;
+                int left = 0, right = s.length() - 1;
+                while (left < right) {
+                    if (s.charAt(left) != s.charAt(right)) return false;
+                    left++;
+                    right--;
+                }
+                return true;
+            }
+
+            @Test
+            @DisplayName("正常分支:回文字符串返回 true")
+            void normalCase() {
+                assertTrue(isPalindrome("aba"));
+                assertTrue(isPalindrome("abba"));
+            }
+
+            @Test
+            @DisplayName("边界情况:空串和单字符")
+            void boundaryCase() {
+                assertTrue(isPalindrome(""));
+                assertTrue(isPalindrome("a"));
+            }
+
+            @Test
+            @DisplayName("异常输入:null 返回 false")
+            void nullCase() {
+                assertFalse(isPalindrome(null));
+            }
+        }
+
+        【错误示例(以下写法会导致编译失败)】
+        ❌ 错误1: package com.example.util;        // 不要 package
+        ❌ 错误2: import com.example.util.MyUtil;   // 不要 import 被测类
+        ❌ 错误3: @InjectMocks private MyUtil util; // 不要注入被测类
+        ❌ 错误4: util.isPalindrome("aba")          // 不要调用被测类实例,调内部静态副本
+        """.formatted(
                 ctx.getClassName(),
                 String.join(" ", ctx.getClassAnnotations()),
                 String.join("\n", ctx.getFields()),

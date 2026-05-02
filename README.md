@@ -32,7 +32,7 @@ PR 触发 → 多 Agent 协作评审 → 行级评论回写 → 自动生成 JUn
 
 ## 🎬 Demo
 
-> Demo 视频: [B 站链接占位] / [YouTube 链接占位]
+> Demo 视频: https://www.bilibili.com/video/BV1HTR5BjEqU/?vd_source=c8e92a04cac57e62c847a21c3b9ec98b
 
 **典型流程**:
 
